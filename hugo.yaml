@@ -1,0 +1,126 @@
+baseURL: "https://scrpzz.github.io/"
+title: "Alessandro Togni"
+theme: PaperMod
+
+languageCode: "en-us"
+defaultContentLanguage: "en"
+
+enableRobotsTXT: true
+enableEmoji: true
+buildDrafts: false
+buildFuture: false
+buildExpired: false
+
+pagination:
+  pagerSize: 10
+
+minify:
+  disableXML: true
+  minifyOutput: true
+
+# Required by PaperMod's client-side search (Fuse.js reads /index.json).
+outputs:
+  home:
+    - HTML
+    - RSS
+    - JSON
+
+params:
+  env: production
+  title: "Alessandro Togni"
+  description: "Data Scientist — flood detection, edge AI, satellite imagery"
+  keywords:
+    - Data Science
+    - Knowledge Distillation
+    - Neural Architecture Search
+    - Edge AI
+    - Remote Sensing
+  author: "Alessandro Togni"
+
+  # Sections featured on the homepage recent-posts list and in the Archive.
+  # Without this, PaperMod defaults to only the single section with the most
+  # pages and silently hides the others (e.g. projects).
+  mainSections:
+    - posts
+    - projects
+
+  defaultTheme: auto
+  disableThemeToggle: false
+
+  ShowReadingTime: true
+  ShowWordCount: true
+  ShowShareButtons: false
+  ShowPostNavLinks: true
+  ShowBreadCrumbs: true
+  ShowCodeCopyButtons: true
+  ShowToc: true
+  TocOpen: false
+  ShowRssButtonInSectionTermList: true
+
+  # Enables KaTeX site-wide (see layouts/_partials/extend_head.html).
+  # Can also be set per-page in front matter.
+  math: true
+
+  assets:
+    disableHLJS: true # use Hugo's built-in Chroma highlighting, not highlight.js
+
+  homeInfoParams:
+    Title: "👋 Hi, I'm Alessandro"
+    Content: >
+      Data scientist at the Italian Space Agency (ASI). I write about knowledge
+      distillation, neural architecture search, and edge AI for satellite
+      remote sensing.
+
+  socialIcons:
+    - name: github
+      url: "https://github.com/atogni"
+    # TODO: add your real profile URLs, then uncomment.
+    # - name: linkedin
+    #   url: "https://www.linkedin.com/in/<your-handle>"
+    # - name: googlescholar
+    #   url: "https://scholar.google.com/citations?user=<your-id>"
+
+menu:
+  main:
+    - identifier: posts
+      name: Posts
+      url: /posts/
+      weight: 10
+    - identifier: projects
+      name: Projects
+      url: /projects/
+      weight: 20
+    - identifier: archive
+      name: Archive
+      url: /archives/
+      weight: 30
+    - identifier: tags
+      name: Tags
+      url: /tags/
+      weight: 40
+    - identifier: search
+      name: Search
+      url: /search/
+      weight: 50
+
+markup:
+  goldmark:
+    extensions:
+      # Pass math delimiters through untouched so KaTeX (client-side) renders
+      # them, instead of Goldmark turning underscores into <em>, etc.
+      # Inline math uses \( \) only — single $ is intentionally NOT a delimiter,
+      # so prose like "$100" or shell "$PATH" is never mistaken for math.
+      passthrough:
+        enable: true
+        delimiters:
+          block:
+            - ['\[', '\]']
+            - ['$$', '$$']
+          inline:
+            - ['\(', '\)']
+  highlight:
+    noClasses: false # use CSS classes so PaperMod's light/dark code themes apply
+    codeFences: true
+    guessSyntax: true
+    lineNos: false
+    style: monokai

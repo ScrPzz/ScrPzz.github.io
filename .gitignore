@@ -1,0 +1,11 @@
+# Hugo build output
+/public/
+/resources/_gen/
+/.hugo_build.lock
+
+# Hugo stats (used by some PostCSS/PurgeCSS setups)
+hugo_stats.json
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
