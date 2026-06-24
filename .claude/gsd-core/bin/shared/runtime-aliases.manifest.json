@@ -43,7 +43,8 @@
   "windsurf": [
     "windsurf",
     "windsurf-cli",
-    "windsurf-next"
+    "windsurf-next",
+    "devin-desktop"
   ],
   "augment": [
     "augment",
@@ -63,6 +64,9 @@
     "hermes",
     "hermes-agent",
     "hermes-cli"
+  ],
+  "kimi": [
+    "kimi"
   ],
   "codebuddy": [
     "codebuddy",

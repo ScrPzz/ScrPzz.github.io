@@ -36,8 +36,12 @@ Parse the first token of $ARGUMENTS:
 
 ## list / status
 
-Call `listSurface(runtimeConfigDir, manifest, CLUSTERS)` from
-`gsd-core/bin/lib/surface.cjs`. Display:
+Load the capability registry and call `listSurface(runtimeConfigDir, manifest, CLUSTERS, registry)` from
+`gsd-core/bin/lib/surface.cjs`. The registry is loaded via:
+```js
+const registry = require('gsd-core/bin/lib/capability-registry.cjs');
+```
+Display:
 
 ```
 Enabled (N skills, ~T tokens):
@@ -67,8 +71,9 @@ Install profile: standard  (from .gsd-profile)
 3. `writeSurface(runtimeConfigDir, surfaceState)`.
 4. Resolve and re-apply:
    ```js
+   const registry = require('gsd-core/bin/lib/capability-registry.cjs');
    const layout = resolveRuntimeArtifactLayout(runtime, runtimeConfigDir, scope);
-   applySurface(runtimeConfigDir, layout, manifest, CLUSTERS);
+   applySurface(runtimeConfigDir, layout, manifest, CLUSTERS, registry);
    ```
 5. Confirm: "Surface updated to profile `<name>`. N skills enabled."
 
@@ -84,8 +89,9 @@ Valid cluster names: `core_loop`, `audit_review`, `milestone`, `research_ideate`
 3. Add cluster to `surfaceState.disabledClusters` (deduplicate).
 4. `writeSurface` → resolve layout → `applySurface`:
    ```js
+   const registry = require('gsd-core/bin/lib/capability-registry.cjs');
    const layout = resolveRuntimeArtifactLayout(runtime, runtimeConfigDir, scope);
-   applySurface(runtimeConfigDir, layout, manifest, CLUSTERS);
+   applySurface(runtimeConfigDir, layout, manifest, CLUSTERS, registry);
    ```
 5. Confirm: "Disabled cluster `<cluster>`. N skills removed from surface."
 
@@ -97,8 +103,9 @@ Valid cluster names: `core_loop`, `audit_review`, `milestone`, `research_ideate`
 2. Remove cluster from `surfaceState.disabledClusters`.
 3. `writeSurface` → resolve layout → `applySurface`:
    ```js
+   const registry = require('gsd-core/bin/lib/capability-registry.cjs');
    const layout = resolveRuntimeArtifactLayout(runtime, runtimeConfigDir, scope);
-   applySurface(runtimeConfigDir, layout, manifest, CLUSTERS);
+   applySurface(runtimeConfigDir, layout, manifest, CLUSTERS, registry);
    ```
 4. Confirm: "Enabled cluster `<cluster>`. N skills added back to surface."
 
@@ -116,16 +123,16 @@ Valid cluster names: `core_loop`, `audit_review`, `milestone`, `research_ideate`
 ## runtimeConfigDir resolution
 
 The `runtimeConfigDir` for `applySurface` is the **base Claude config directory**
-(`~/.claude`), NOT the skills sub-directory (`/home/atogni/Desktop/progetti/atogni.github.io/.claude/skills`).
+(`/home/atogni/Desktop/progetti/atogni.github.io/.claude`), NOT the skills sub-directory (`/home/atogni/Desktop/progetti/atogni.github.io/.claude/skills`).
 
 This matches `installRuntimeArtifacts` and `uninstallRuntimeArtifacts`, which also
-receive `~/.claude` as `configDir`. The skill dirs themselves live at
+receive `/home/atogni/Desktop/progetti/atogni.github.io/.claude` as `configDir`. The skill dirs themselves live at
 `/home/atogni/Desktop/progetti/atogni.github.io/.claude/skills/gsd-*/` because the `claude global` layout has `destSubpath =
 'skills'` — they are derived from `configDir`, not the root for it.
 
 ```bash
 # Claude Code — global install
-RUNTIME_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+RUNTIME_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-/home/atogni/Desktop/progetti/atogni.github.io/.claude}"
 SCOPE="global"
 
 # Artifact destinations are derived from runtime layout

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gsd-hook-version: 1.4.5
+# gsd-hook-version: 1.5.0
 # gsd-graphify-update.sh — PostToolUse hook (Bash matcher) that auto-rebuilds
 # the project knowledge graph after main HEAD advances on the default branch.
 #

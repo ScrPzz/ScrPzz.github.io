@@ -15,8 +15,14 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 const node_fs_1 = __importDefault(require("node:fs"));
 const node_path_1 = __importDefault(require("node:path"));
 // eslint-disable-next-line @typescript-eslint/no-require-imports
-const core = require("./core.cjs");
-const { output, error, getMilestonePhaseFilter, toPosixPath } = core;
+const io = require("./io.cjs");
+const { output, error } = io;
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const roadmapParser = require("./roadmap-parser.cjs");
+const { getMilestonePhaseFilter } = roadmapParser;
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const coreUtils = require("./core-utils.cjs");
+const { toPosixPath } = coreUtils;
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const planningWorkspace = require("./planning-workspace.cjs");
 const { planningDir } = planningWorkspace;
@@ -139,6 +145,13 @@ function parseCurrentTest(content) {
         || section.match(/^expected:\s*\|\n([\s\S]+)/m);
     const expectedInlineMatch = section.match(/^expected:\s*(.+)\s*$/m);
     if (!numberMatch || !nameMatch || (!expectedBlockMatch && !expectedInlineMatch)) {
+        if (!numberMatch && !nameMatch && !expectedBlockMatch && !expectedInlineMatch) {
+            const pendingTest = parseFirstPendingTest(content);
+            if (pendingTest) {
+                return pendingTest;
+            }
+            error('Current Test section is non-structured and no pending UAT test remains to resume');
+        }
         error('Current Test section is malformed');
     }
     let expected;
@@ -158,6 +171,55 @@ function parseCurrentTest(content) {
         name: (0, security_cjs_1.sanitizeForDisplay)(nameMatch[1].trim()),
         expected: (0, security_cjs_1.sanitizeForDisplay)(expected),
     };
+}
+function parseFirstPendingTest(content) {
+    const testsMatch = content.match(/##\s*Tests\s*\n([\s\S]*?)(?=\n##\s|$)/i);
+    if (!testsMatch) {
+        return null;
+    }
+    const testsSection = testsMatch[1];
+    const headingPattern = /^###\s*(\d+)\.\s*([^\n]+)\s*$/gm;
+    const headings = [];
+    let headingMatch;
+    while ((headingMatch = headingPattern.exec(testsSection)) !== null) {
+        headings.push({
+            index: headingMatch.index,
+            number: parseInt(headingMatch[1], 10),
+            name: headingMatch[2].trim(),
+        });
+    }
+    for (let i = 0; i < headings.length; i += 1) {
+        const current = headings[i];
+        const next = headings[i + 1];
+        const block = testsSection.slice(current.index, next ? next.index : undefined);
+        if (!/^result:\s*\[?pending\]?\s*$/im.test(block)) {
+            continue;
+        }
+        const expected = parseExpectedFromTestBlock(block);
+        if (!expected) {
+            error(`Pending UAT test ${current.number} is missing an expected field`);
+        }
+        return {
+            complete: false,
+            number: current.number,
+            name: (0, security_cjs_1.sanitizeForDisplay)(current.name),
+            expected: (0, security_cjs_1.sanitizeForDisplay)(expected),
+        };
+    }
+    return null;
+}
+function parseExpectedFromTestBlock(block) {
+    const expectedBlockMatch = block.match(/^expected:\s*\|\n([\s\S]*?)(?=^\w[\w-]*:\s)/m)
+        || block.match(/^expected:\s*\|\n([\s\S]+)/m);
+    if (expectedBlockMatch) {
+        return expectedBlockMatch[1]
+            .split('\n')
+            .map((line) => line.replace(/^ {2}/, ''))
+            .join('\n')
+            .trim();
+    }
+    const expectedInlineMatch = block.match(/^expected:\s*(.+)\s*$/m);
+    return expectedInlineMatch ? expectedInlineMatch[1].trim() : null;
 }
 // ─── buildCheckpoint ──────────────────────────────────────────────────────────
 function buildCheckpoint(currentTest) {

@@ -58,6 +58,18 @@
  *     [--name <name>]
  *     [--archive-phases]               Move phase dirs to milestones/vX.Y-phases/
  *
+ * User Story Validation:
+ *   user-story validate --story "..."  Validate "As a / I want to / so that" format
+ *                                      Returns JSON { valid, errors[], slots: {role,capability,outcome} | null }
+ *                                      --pick valid  Emit bare boolean (for workflow boolean checks)
+ *
+ * Drift Guard (ADR-22):
+ *   drift-guard authority                Resolve effective source-grounding authority
+ *                                        (reads plan_review.source_grounding_authority + intel.enabled from config)
+ *   drift-guard severity --status <S>    Classify a symbol verdict into { severity, hardBlock }
+ *     [--authority <A>]                  Status: VERIFIED|MISSING|AMBIGUOUS|UNCHECKABLE
+ *                                        Authority: grep|intel|treesitter|lsp|scip (default: config-resolved)
+ *
  * Validation:
  *   validate consistency               Check phase numbering, disk/roadmap sync
  *   validate health [--repair]         Check .planning/ integrity, optionally repair
@@ -163,6 +175,17 @@
  *   learnings prune --older-than <dur>   Remove entries older than duration (e.g. 90d)
  *   learnings delete <id>                Delete a learning by ID
  *
+ * Loop Extension Point Queries (ADR-857 phase 3c):
+ *   loop render-hooks <point>            Resolve + render active Capability hooks at a loop point
+ *                                        Returns JSON envelope { point, activeHooks, rendered }
+ *                                        Valid points: discuss:pre/post, plan:pre/post,
+ *                                        execute:pre/wave:pre/wave:post/post, verify:pre/post, ship:pre/post
+ *
+ * Capability State (ADR-857 phase 4b):
+ *   capability state [--config-dir <path>]  Resolve per-capability install/surface/hook-activation state
+ *                                           Returns JSON envelope { runtimeConfigDir, capabilities[] }
+ *                                           --config-dir: runtime config dir (default: auto-detect current runtime)
+ *
  * GSD-2 Migration:
  *   from-gsd2 [--path <dir>] [--force] [--dry-run]
  *             Import a GSD-2 (.gsd/) project back to GSD v1 (.planning/) format
@@ -171,13 +194,14 @@
 const fs = require('fs');
 const path = require('path');
 const { ExitError, runMain } = require('./lib/cli-exit.cjs');
-const core = require('./lib/core.cjs');
-const { error, ERROR_REASON } = core;
+const io = require('./lib/io.cjs');
+const { error, ERROR_REASON, setJsonErrorMode, output } = io;
+const projectRoot = require('./lib/project-root.cjs');
 // Resolve findProjectRoot lazily at call time rather than binding it at module
-// load. It is a re-export from core.cjs (sourced from project-root.cjs); a
-// call-time lookup is robust against any require/load-ordering edge where the
-// re-export isn't bound yet when this entrypoint is first required (#604).
-const findProjectRoot = (...args) => core.findProjectRoot(...args);
+// load. It is sourced from project-root.cjs; a call-time lookup is robust
+// against any require/load-ordering edge where the export isn't bound yet
+// when this entrypoint is first required (#604).
+const findProjectRoot = (...args) => projectRoot.findProjectRoot(...args);
 const { getActiveWorkstream } = require('./lib/planning-workspace.cjs');
 const { resolveActiveWorkstream, applyResolvedWorkstreamEnv } = require('./lib/active-workstream-store.cjs');
 const state = require('./lib/state.cjs');
@@ -190,8 +214,6 @@ const milestone = require('./lib/milestone.cjs');
 const commands = require('./lib/commands.cjs');
 const init = require('./lib/init.cjs');
 const frontmatter = require('./lib/frontmatter.cjs');
-const profilePipeline = require('./lib/profile-pipeline.cjs');
-const profileOutput = require('./lib/profile-output.cjs');
 const workstream = require('./lib/workstream.cjs');
 const docs = require('./lib/docs.cjs');
 const learnings = require('./lib/learnings.cjs');
@@ -201,6 +223,9 @@ const { routeVerifyCommand } = require('./lib/verify-command-router.cjs');
 const { routeVerificationCommand } = require('./lib/verification-command-router.cjs');
 const verification = require('./lib/verification.cjs');
 const { routeInitCommand } = require('./lib/init-command-router.cjs');
+const loopResolver = require('./lib/loop-resolver.cjs');
+const capabilityState = require('./lib/capability-state.cjs');
+const capabilityWriter = require('./lib/capability-writer.cjs');
 const { routePhaseCommand } = require('./lib/phase-command-router.cjs');
 const { routePhasesCommand } = require('./lib/phases-command-router.cjs');
 const { routeValidateCommand } = require('./lib/validate-command-router.cjs');
@@ -209,6 +234,8 @@ const { routeAgentCommand } = require('./lib/agent-command-router.cjs');
 const { routeCheckCommand } = require('./lib/check-command-router.cjs');
 const { routeTaskCommand } = require('./lib/task-command-router.cjs');
 const { parseNamedArgs, parseMultiwordArg } = require('./lib/command-arg-projection.cjs');
+const { cmdGitBaseBranch } = require('./lib/git-base-branch.cjs');
+const { getEffectiveAuthority, classifyDriftSeverity } = require('./lib/plan-drift-guard.cjs');
 
 // ─── Bridge collapsed (Phase 4) ────────────────────────────────────────────────
 // Non-family commands now run through their CJS handlers directly. Keep the
@@ -229,7 +256,7 @@ const { parseNamedArgs, parseMultiwordArg } = require('./lib/command-arg-project
  * @param {string} opts.cwd - project dir
  * @param {boolean} opts.raw - raw output mode
  * @param {Function} opts.error - error reporter
- * @param {Function} opts.output - output emitter (core.output)
+ * @param {Function} opts.output - output emitter (output)
  */
 function _dispatchNonFamily({ registryCommand, registryArgs, legacyCommand, legacyArgs, cwd, raw, error, output }) {
   void registryCommand;
@@ -241,6 +268,122 @@ function _dispatchNonFamily({ registryCommand, registryArgs, legacyCommand, lega
   void error;
   void output;
   return false;
+}
+
+// ─── ADR-959: Capability Command Dispatch ─────────────────────────────────────
+
+/**
+ * Dispatch a command via the capability registry's commandFamilies index.
+ *
+ * Consulted in the `default` case of `runCommand` BEFORE the unknown-command
+ * error is emitted. Returns:
+ *   true  — command was "consumed" (found in registry, or a dispatch error was
+ *            emitted); "Unknown command" is suppressed in all consumed cases.
+ *   false — command not found in the registry (including prototype-pollution
+ *            guard hits and missing/empty commandFamilies); caller falls through
+ *            to the existing unknown-command error path.
+ * Behavior-preserving when commandFamilies is empty ({}).
+ *
+ * Injectable for tests:
+ * - `registry` defaults to require('./lib/capability-registry.cjs')
+ * - `requireModule` defaults to a confinement-checked loader that resolves the
+ *   module path relative to bin/lib/ and asserts it stays within that directory
+ *   before requiring — defense-in-depth against corrupted/hand-edited registry entries.
+ *
+ * @param {object}   opts
+ * @param {string}   opts.command        The command name (top-level gsd-tools command)
+ * @param {string[]} opts.args           Remaining args passed to the router
+ * @param {string}   opts.cwd            Project working directory
+ * @param {boolean}  opts.raw            Raw output mode flag
+ * @param {Function} opts.error          Error reporter (io.error)
+ * @param {object}   [opts.registry]     Injectable registry (for tests)
+ * @param {Function} [opts.requireModule] Injectable module loader (for tests)
+ * @returns {boolean} true if the command was dispatched, false otherwise
+ */
+function dispatchCapabilityCommand({ command, args, cwd, raw, error, registry, requireModule }) {
+  // Prototype-pollution guard: reject reserved property names as command keys
+  if (command === '__proto__' || command === 'constructor' || command === 'prototype') {
+    return false;
+  }
+
+  // Resolve defaults (injectable for tests)
+  const reg = registry !== undefined ? registry : require('./lib/capability-registry.cjs');
+
+  // Default requireModule: confined to bin/lib/ — validate the module name is a
+  // safe bare .cjs basename (no path separators, no directory traversal), then
+  // resolve and assert confinement, then require the RESOLVED absolute path so
+  // the checked representation and the required representation are identical.
+  const libDir = path.join(__dirname, 'lib');
+  const defaultRequireModule = function (m) {
+    // Step 1: validate m is a bare .cjs basename — same conservative pattern the
+    // generator uses. Rejects any value with path separators (/, \, ..) or
+    // missing the .cjs extension before we even touch the filesystem.
+    if (typeof m !== 'string' || !/^[A-Za-z0-9._-]+\.cjs$/.test(m)) {
+      throw new Error('capability module must be a bare .cjs basename: ' + JSON.stringify(m));
+    }
+    // Step 2: confinement check — belt-and-suspenders even after the basename
+    // validation above. Resolved path must be inside libDir (not equal to it,
+    // and must start with libDir + sep so "libDir-suffix" can't sneak through).
+    const resolved = path.resolve(libDir, m);
+    if (resolved === libDir || !resolved.startsWith(libDir + path.sep)) {
+      throw new Error('capability module path escapes bin/lib/: ' + JSON.stringify(m));
+    }
+    // Step 3: require the resolved absolute path — the SAME representation that
+    // was checked above, not the concatenated './lib/' + m string.
+    return require(resolved);
+  };
+  const loadModule = requireModule !== undefined ? requireModule : defaultRequireModule;
+
+  // Look up the command family in the registry
+  const families = reg && reg.commandFamilies;
+  if (!families || typeof families !== 'object') return false;
+
+  const entry = families[command];
+  if (!entry || typeof entry !== 'object') return false;
+
+  // Resolve and call the router
+  let mod;
+  try {
+    mod = loadModule(entry.module);
+  } catch (_) {
+    // Module not found, load error, or confinement violation — surface a
+    // diagnostic and return true (consumed) so "Unknown command" is suppressed.
+    error('capability command "' + command + '" module "' + entry.module + '" failed to load');
+    return true; // consumed — don't emit "Unknown command"
+  }
+
+  // Own-property guard: prevent invoking inherited prototype methods
+  // (constructor, toString, hasOwnProperty, etc.) as a router when the registry
+  // entry names one of those. Must come before the typeof check.
+  if (!mod || !Object.prototype.hasOwnProperty.call(mod, entry.router)) {
+    error('capability command "' + command + '" router "' + entry.router + '" is not an own export of module "' + entry.module + '"');
+    return true; // consumed — don't emit "Unknown command"
+  }
+  const fn = mod[entry.router];
+  if (typeof fn !== 'function') {
+    // Router export not found — surface a diagnostic and return true (consumed)
+    // so "Unknown command" is suppressed.
+    error('capability command "' + command + '" router "' + entry.router + '" is not a function in module "' + entry.module + '"');
+    return true; // consumed — don't emit "Unknown command"
+  }
+
+  let _result;
+  try {
+    _result = fn({ args, cwd, raw, error });
+  } catch (e) {
+    if (e instanceof ExitError) throw e; // intentional structured error from the router (honors --json-errors) — propagate untouched
+    error(
+      'capability command "' + command + '" router "' + entry.router + '" in module "' + entry.module + '" threw: ' + (e && e.message ? e.message : String(e)),
+      ERROR_REASON.SDK_FAIL_FAST,
+    );
+  }
+  if (_result && typeof _result.then === 'function') {
+    error(
+      'capability command "' + command + '" router "' + entry.router + '" in module "' + entry.module + '" must be synchronous (returned a Promise); async capability routers are not supported.',
+      ERROR_REASON.SDK_FAIL_FAST,
+    );
+  }
+  return true;
 }
 
 // ─── Arg parsing helpers ──────────────────────────────────────────────────────
@@ -262,10 +405,10 @@ async function main() {
   // their plain-text diagnostic.
   const jsonErrorsIdx = args.indexOf('--json-errors');
   if (jsonErrorsIdx !== -1) {
-    core.setJsonErrorMode(true);
+    setJsonErrorMode(true);
     args.splice(jsonErrorsIdx, 1);
   } else if (process.env.GSD_JSON_ERRORS === '1') {
-    core.setJsonErrorMode(true);
+    setJsonErrorMode(true);
   }
 
   // Optional cwd override for sandboxed subagents running outside project root.
@@ -291,7 +434,7 @@ async function main() {
   // Resolve worktree root: in a linked worktree, .planning/ lives in the main worktree.
   // However, in monorepo worktrees where the subdirectory itself owns .planning/,
   // skip worktree resolution — the CWD is already the correct project root.
-  const { resolveWorktreeRoot } = require('./lib/core.cjs');
+  const { resolveWorktreeRoot } = require('./lib/worktree-safety.cjs');
   if (!fs.existsSync(path.join(cwd, '.planning'))) {
     const worktreeRoot = resolveWorktreeRoot(cwd);
     if (worktreeRoot !== cwd) {
@@ -376,12 +519,12 @@ async function main() {
   const TOP_LEVEL_USAGE = 'Usage: gsd-tools <command> [args] [--raw] [--pick <field>] [--cwd <path>] [--ws <name>] [--json-errors]\n' +
     'Commands: agent, agent-skills, audit-open, audit-uat, check, check-commit, commit, commit-to-subrepo, ' +
     'config-ensure-section, config-get, config-new-project, config-path, config-set, migrate-config, ' +
-    'current-timestamp, detect-custom-files, docs-init, effort, extract-messages, find-phase, ' +
+    'current-timestamp, detect-custom-files, docs-init, drift-guard, effort, extract-messages, find-phase, ' +
     'from-gsd2, frontmatter, gap-analysis, generate-claude-md, generate-claude-profile, ' +
     'generate-dev-preferences, generate-slug, graphify, history-digest, init, intel, ' +
-    'classify-confidence, learnings, list-todos, milestone, package-legitimacy, phase, phase-plan-index, phases, profile-questionnaire, ' +
+    'capability, classify-confidence, git, learnings, list-todos, loop, milestone, package-legitimacy, phase, phase-plan-index, phases, profile-questionnaire, ' +
     'profile-sample, progress, prompt-budget, requirements, research-plan, research-store, resolve-granularity, resolve-model, roadmap, scaffold, state, ' +
-    'task, template, validate, verify, verify-path-exists, verify-summary, workstream, worktree\n\n' +
+    'task, template, user-story, validate, verify, verify-path-exists, verify-summary, workstream, worktree\n\n' +
     'Global flags:\n' +
     '  --raw              Emit raw output without post-processing\n' +
     '  --pick <field>     Extract a single field from JSON output (dot/bracket notation)\n' +
@@ -420,11 +563,17 @@ async function main() {
   // Multi-repo guard: resolve project root for commands that read/write .planning/.
   // Skip for pure-utility commands that don't touch .planning/ to avoid unnecessary
   // filesystem traversal on every invocation.
+  // 'loop' and 'capability' are intentionally NOT in SKIP_ROOT_RESOLUTION.
+  // Both are registry/config queries that resolve activation via
+  // .planning/config.json; they need the project root (cwd) for correct
+  // `when` key resolution. If one is ever moved to SKIP_ROOT_RESOLUTION,
+  // move the other at the same time (keep them consistent).
   const SKIP_ROOT_RESOLUTION = new Set([
     'generate-slug', 'current-timestamp', 'verify-path-exists',
     'verify-summary', 'template', 'frontmatter', 'detect-custom-files',
     'worktree', 'prompt-budget',
     'research-store', 'research-plan', 'package-legitimacy', 'classify-confidence',
+    'user-story', // pure string validation — no .planning/ access needed
   ]);
   if (!SKIP_ROOT_RESOLUTION.has(command)) {
     cwd = findProjectRoot(cwd);
@@ -448,7 +597,7 @@ async function main() {
   }
 
   // Intercept stdout to transparently resolve @file: references (#1891).
-  // core.cjs output() writes @file:<path> when JSON > 50KB. The --pick path
+  // io.cjs output() writes @file:<path> when JSON > 50KB. The --pick path
   // already resolves this, but the normal path wrote @file: to stdout, forcing
   // every workflow to have a bash-specific `if [[ "$INIT" == @file:* ]]` check
   // that breaks on PowerShell and other non-bash shells.
@@ -654,7 +803,7 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
         cwd,
         raw,
         error,
-        output: core.output,
+        output: output,
       });
       if (!handled) phase.cmdFindPhase(cwd, args[1], raw);
       break;
@@ -747,7 +896,7 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
           cwd,
           raw,
           error,
-          output: core.output,
+          output: output,
         });
         if (handled) break;
       }
@@ -809,7 +958,7 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
         cwd,
         raw,
         error,
-        output: core.output,
+        output: output,
       });
       if (!handled) commands.cmdGenerateSlug(args[1], raw);
       break;
@@ -849,7 +998,7 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
         cwd,
         raw,
         error,
-        output: core.output,
+        output: output,
       });
       if (!handled) config.cmdConfigEnsureSection(cwd, raw);
       break;
@@ -865,7 +1014,7 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
         cwd,
         raw,
         error,
-        output: core.output,
+        output: output,
       });
       if (!handled) config.cmdConfigSet(cwd, args[1], args[2], raw);
       break;
@@ -881,7 +1030,7 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
         cwd,
         raw,
         error,
-        output: core.output,
+        output: output,
       });
       if (!handled) config.cmdConfigSetModelProfile(cwd, args[1], raw);
       break;
@@ -906,7 +1055,7 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
         cwd,
         raw,
         error,
-        output: core.output,
+        output: output,
       });
       if (!handled) config.cmdConfigGet(cwd, args[1], raw, defaultValue);
       break;
@@ -922,7 +1071,7 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
         cwd,
         raw,
         error,
-        output: core.output,
+        output: output,
       });
       if (!handled) config.cmdConfigNewProject(cwd, args[1], raw);
       break;
@@ -1021,7 +1170,8 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
       if (subcommand === 'complete') {
         const milestoneName = parseMultiwordArg(args, 'name');
         const archivePhases = args.includes('--archive-phases');
-        milestone.cmdMilestoneComplete(cwd, args[2], { name: milestoneName, archivePhases }, raw);
+        const force = args.includes('--force');
+        milestone.cmdMilestoneComplete(cwd, args[2], { name: milestoneName, archivePhases, force }, raw);
       } else {
         error('Unknown milestone subcommand. Available: complete', ERROR_REASON.SDK_UNKNOWN_COMMAND);
       }
@@ -1034,7 +1184,7 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
         args,
         cwd,
         raw,
-        output: core.output,
+        output: output,
         error,
       });
       break;
@@ -1043,27 +1193,6 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
     case 'progress': {
       const subcommand = args[1] || 'json';
       commands.cmdProgressRender(cwd, subcommand, raw);
-      break;
-    }
-
-    case 'audit-uat': {
-      const uat = require('./lib/uat.cjs');
-      uat.cmdAuditUat(cwd, raw);
-      break;
-    }
-
-    case 'audit-open': {
-      const { auditOpenArtifacts, formatAuditReport } = require('./lib/audit.cjs');
-      const wantJson = args.includes('--json');
-      const result = auditOpenArtifacts(cwd);
-      if (wantJson) {
-        // core.output JSON-stringifies its first arg; pass the object directly.
-        core.output(result, raw);
-      } else {
-        // Human-readable report must bypass JSON encoding — use the rawValue
-        // form (third arg) which core.output emits verbatim.
-        core.output(null, true, formatAuditReport(result));
-      }
       break;
     }
 
@@ -1118,6 +1247,158 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
       break;
     }
 
+    case 'loop': {
+      // loop render-hooks <point>
+      const loopSubcommand = args[1];
+      if (loopSubcommand === 'render-hooks') {
+        let loopConfigDir = null;
+        const configDirEqArg = args.find(arg => arg.startsWith('--config-dir='));
+        const configDirIdx = args.indexOf('--config-dir');
+        if (configDirEqArg) {
+          const value = configDirEqArg.slice('--config-dir='.length).trim();
+          if (!value) error('Missing value for --config-dir', ERROR_REASON ? ERROR_REASON.USAGE : undefined);
+          loopConfigDir = value;
+        } else if (configDirIdx !== -1) {
+          const value = args[configDirIdx + 1];
+          if (!value || value.startsWith('--')) {
+            error('Missing value for --config-dir', ERROR_REASON ? ERROR_REASON.USAGE : undefined);
+          }
+          loopConfigDir = value;
+        }
+        // --active-cap <capId>: parse and validate before delegating
+        let loopActiveCap = undefined;
+        const activeCapEqArg = args.find(arg => arg.startsWith('--active-cap='));
+        const activeCapIdx = args.indexOf('--active-cap');
+        if (activeCapEqArg) {
+          const value = activeCapEqArg.slice('--active-cap='.length).trim();
+          if (!value) error('Missing value for --active-cap (e.g. --active-cap tdd)', ERROR_REASON ? ERROR_REASON.USAGE : undefined);
+          loopActiveCap = value;
+        } else if (activeCapIdx !== -1) {
+          const value = args[activeCapIdx + 1];
+          if (!value || value.startsWith('--')) {
+            error('Missing value for --active-cap (e.g. --active-cap tdd)', ERROR_REASON ? ERROR_REASON.USAGE : undefined);
+          }
+          loopActiveCap = value;
+        }
+        loopResolver.cmdLoopRenderHooks(cwd, args[2], raw, {
+          configDir: loopConfigDir ? path.resolve(loopConfigDir) : undefined,
+          activeCap: loopActiveCap,
+        });
+      } else {
+        error(
+          `Unknown loop subcommand: ${loopSubcommand}. Available: render-hooks`,
+          ERROR_REASON ? ERROR_REASON.SDK_UNKNOWN_COMMAND : undefined,
+        );
+      }
+      break;
+    }
+
+    case 'capability': {
+      // capability state [--config-dir <path>]
+      // Root resolution: 'capability' is NOT in SKIP_ROOT_RESOLUTION for the
+      // same reason 'loop' is not: both are registry/config queries that need
+      // the project root (cwd) for .planning/config.json activation resolution.
+      // If 'loop' were ever added to SKIP_ROOT_RESOLUTION, 'capability' should
+      // be added at the same time to keep them consistent.
+      const capSubcommand = args[1];
+      if (capSubcommand === 'state') {
+        const configDirIdx = args.indexOf('--config-dir');
+        let configDir = null;
+        if (configDirIdx !== -1) {
+          const configDirVal = args[configDirIdx + 1];
+          // Validate that --config-dir has a following non-flag value.
+          if (!configDirVal || configDirVal.startsWith('--')) {
+            error('Missing value for --config-dir', ERROR_REASON ? ERROR_REASON.USAGE : undefined);
+          }
+          configDir = configDirVal;
+        }
+        const resolvedConfigDir = configDir ? path.resolve(configDir) : null;
+        capabilityState.cmdCapabilityState(cwd, resolvedConfigDir, raw, {});
+      } else if (capSubcommand === 'set') {
+        // capability set <id> [--on|--off|--enable|--disable] [--gate <key>=<bool>]... [--config-dir <dir>] [--runtime <r>] [--scope <s>]
+        const capId = args[2];
+        if (!capId || capId.startsWith('--')) {
+          error('Missing capability id for: capability set <id>', ERROR_REASON ? ERROR_REASON.USAGE : undefined);
+        }
+        // Parse --config-dir
+        const setConfigDirIdx = args.indexOf('--config-dir');
+        let setConfigDir = null;
+        if (setConfigDirIdx !== -1) {
+          const setConfigDirVal = args[setConfigDirIdx + 1];
+          if (!setConfigDirVal || setConfigDirVal.startsWith('--')) {
+            error('Missing value for --config-dir', ERROR_REASON ? ERROR_REASON.USAGE : undefined);
+          }
+          setConfigDir = setConfigDirVal;
+        }
+        const resolvedSetConfigDir = setConfigDir ? path.resolve(setConfigDir) : null;
+        // Parse --on/--enable and --off/--disable (mutually exclusive)
+        const hasOn = args.includes('--on') || args.includes('--enable');
+        const hasOff = args.includes('--off') || args.includes('--disable');
+        if (hasOn && hasOff) {
+          error('Conflicting flags: --on/--enable and --off/--disable cannot both be present', ERROR_REASON ? ERROR_REASON.USAGE : undefined);
+        }
+        let setEnabled;
+        if (hasOn) {
+          setEnabled = true;
+        } else if (hasOff) {
+          setEnabled = false;
+        }
+        // Parse --gate <key>=<bool> (repeatable)
+        const setGates = {};
+        for (let gi = 0; gi < args.length; gi++) {
+          if (args[gi] === '--gate') {
+            const gateVal = args[gi + 1];
+            if (!gateVal || gateVal.startsWith('--')) {
+              error('Missing value for --gate (expected <key>=<true|false>)', ERROR_REASON ? ERROR_REASON.USAGE : undefined);
+            }
+            const eqIdx = gateVal.indexOf('=');
+            if (eqIdx === -1) {
+              error(`Malformed --gate value "${gateVal}": expected <key>=<true|false>`, ERROR_REASON ? ERROR_REASON.USAGE : undefined);
+            }
+            const gateKey = gateVal.slice(0, eqIdx);
+            const gateBoolStr = gateVal.slice(eqIdx + 1);
+            if (gateBoolStr !== 'true' && gateBoolStr !== 'false') {
+              error(`Malformed --gate value "${gateVal}": bool must be true or false`, ERROR_REASON ? ERROR_REASON.USAGE : undefined);
+            }
+            setGates[gateKey] = gateBoolStr === 'true';
+            gi++; // skip consumed value
+          }
+        }
+        // Parse --runtime and --scope (validate that values are present and not flags)
+        const runtimeIdx = args.indexOf('--runtime');
+        let setRuntime;
+        if (runtimeIdx !== -1) {
+          const runtimeVal = args[runtimeIdx + 1];
+          if (!runtimeVal || runtimeVal.startsWith('--')) {
+            error('Missing value for --runtime', ERROR_REASON ? ERROR_REASON.USAGE : undefined);
+          }
+          setRuntime = runtimeVal;
+        }
+        const scopeIdx = args.indexOf('--scope');
+        let setScope;
+        if (scopeIdx !== -1) {
+          const scopeVal = args[scopeIdx + 1];
+          if (!scopeVal || scopeVal.startsWith('--')) {
+            error('Missing value for --scope', ERROR_REASON ? ERROR_REASON.USAGE : undefined);
+          }
+          setScope = scopeVal;
+        }
+        capabilityWriter.cmdCapabilitySet(
+          cwd,
+          resolvedSetConfigDir,
+          capId,
+          { enabled: setEnabled, gates: Object.keys(setGates).length > 0 ? setGates : undefined, runtime: setRuntime, scope: setScope },
+          raw,
+        );
+      } else {
+        error(
+          `Unknown capability subcommand: ${capSubcommand}. Available: state, set`,
+          ERROR_REASON ? ERROR_REASON.SDK_UNKNOWN_COMMAND : undefined,
+        );
+      }
+      break;
+    }
+
     case 'phase-plan-index': {
       phase.cmdPhasePlanIndex(cwd, args[1], raw);
       break;
@@ -1144,94 +1425,6 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
         limit: limitIdx !== -1 ? parseInt(args[limitIdx + 1], 10) : 10,
         freshness: freshnessIdx !== -1 ? args[freshnessIdx + 1] : null,
       }, raw);
-      break;
-    }
-
-    // ─── Profiling Pipeline ────────────────────────────────────────────────
-
-    case 'scan-sessions': {
-      const pathIdx = args.indexOf('--path');
-      const sessionsPath = pathIdx !== -1 ? args[pathIdx + 1] : null;
-      const verboseFlag = args.includes('--verbose');
-      const jsonFlag = args.includes('--json');
-      await profilePipeline.cmdScanSessions(sessionsPath, { verbose: verboseFlag, json: jsonFlag }, raw);
-      break;
-    }
-
-    case 'extract-messages': {
-      const sessionIdx = args.indexOf('--session');
-      const sessionId = sessionIdx !== -1 ? args[sessionIdx + 1] : null;
-      const limitIdx = args.indexOf('--limit');
-      const limit = limitIdx !== -1 ? parseInt(args[limitIdx + 1], 10) : null;
-      const pathIdx = args.indexOf('--path');
-      const sessionsPath = pathIdx !== -1 ? args[pathIdx + 1] : null;
-      const projectArg = args[1];
-      if (!projectArg || projectArg.startsWith('--')) {
-        error('Usage: gsd-tools extract-messages <project> [--session <id>] [--limit N] [--path <dir>]\nRun scan-sessions first to see available projects.', ERROR_REASON.USAGE);
-      }
-      await profilePipeline.cmdExtractMessages(projectArg, { sessionId, limit }, raw, sessionsPath);
-      break;
-    }
-
-    case 'profile-sample': {
-      const pathIdx = args.indexOf('--path');
-      const sessionsPath = pathIdx !== -1 ? args[pathIdx + 1] : null;
-      const limitIdx = args.indexOf('--limit');
-      const limit = limitIdx !== -1 ? parseInt(args[limitIdx + 1], 10) : 150;
-      const maxPerIdx = args.indexOf('--max-per-project');
-      const maxPerProject = maxPerIdx !== -1 ? parseInt(args[maxPerIdx + 1], 10) : null;
-      const maxCharsIdx = args.indexOf('--max-chars');
-      const maxChars = maxCharsIdx !== -1 ? parseInt(args[maxCharsIdx + 1], 10) : 500;
-      await profilePipeline.cmdProfileSample(sessionsPath, { limit, maxPerProject, maxChars }, raw);
-      break;
-    }
-
-    // ─── Profile Output ──────────────────────────────────────────────────
-
-    case 'write-profile': {
-      const inputIdx = args.indexOf('--input');
-      const inputPath = inputIdx !== -1 ? args[inputIdx + 1] : null;
-      if (!inputPath) error('--input <analysis-json-path> is required', ERROR_REASON.USAGE);
-      const outputIdx = args.indexOf('--output');
-      const outputPath = outputIdx !== -1 ? args[outputIdx + 1] : null;
-      profileOutput.cmdWriteProfile(cwd, { input: inputPath, output: outputPath }, raw);
-      break;
-    }
-
-    case 'profile-questionnaire': {
-      const answersIdx = args.indexOf('--answers');
-      const answers = answersIdx !== -1 ? args[answersIdx + 1] : null;
-      profileOutput.cmdProfileQuestionnaire({ answers }, raw);
-      break;
-    }
-
-    case 'generate-dev-preferences': {
-      const analysisIdx = args.indexOf('--analysis');
-      const analysisPath = analysisIdx !== -1 ? args[analysisIdx + 1] : null;
-      const outputIdx = args.indexOf('--output');
-      const outputPath = outputIdx !== -1 ? args[outputIdx + 1] : null;
-      const stackIdx = args.indexOf('--stack');
-      const stack = stackIdx !== -1 ? args[stackIdx + 1] : null;
-      profileOutput.cmdGenerateDevPreferences(cwd, { analysis: analysisPath, output: outputPath, stack }, raw);
-      break;
-    }
-
-    case 'generate-claude-profile': {
-      const analysisIdx = args.indexOf('--analysis');
-      const analysisPath = analysisIdx !== -1 ? args[analysisIdx + 1] : null;
-      const outputIdx = args.indexOf('--output');
-      const outputPath = outputIdx !== -1 ? args[outputIdx + 1] : null;
-      const globalFlag = args.includes('--global');
-      profileOutput.cmdGenerateClaudeProfile(cwd, { analysis: analysisPath, output: outputPath, global: globalFlag }, raw);
-      break;
-    }
-
-    case 'generate-claude-md': {
-      const outputIdx = args.indexOf('--output');
-      const outputPath = outputIdx !== -1 ? args[outputIdx + 1] : null;
-      const autoFlag = args.includes('--auto');
-      const forceFlag = args.includes('--force');
-      profileOutput.cmdGenerateClaudeMd(cwd, { output: outputPath, auto: autoFlag, force: forceFlag }, raw);
       break;
     }
 
@@ -1279,83 +1472,6 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
       break;
     }
 
-    // ─── Intel ────────────────────────────────────────────────────────────
-
-    case 'intel': {
-      const intel = require('./lib/intel.cjs');
-      const subcommand = args[1];
-      if (subcommand === 'query') {
-        const term = args[2];
-        if (!term) error('Usage: gsd-tools intel query <term>', ERROR_REASON.USAGE);
-        const planningDir = path.join(cwd, '.planning');
-        core.output(intel.intelQuery(term, planningDir), raw);
-      } else if (subcommand === 'status') {
-        const planningDir = path.join(cwd, '.planning');
-        const status = intel.intelStatus(planningDir);
-        if (!raw && status.files) {
-          for (const file of Object.values(status.files)) {
-            if (file.updated_at) {
-              file.updated_at = core.timeAgo(new Date(file.updated_at));
-            }
-          }
-        }
-        core.output(status, raw);
-      } else if (subcommand === 'diff') {
-        const planningDir = path.join(cwd, '.planning');
-        core.output(intel.intelDiff(planningDir), raw);
-      } else if (subcommand === 'snapshot') {
-        const planningDir = path.join(cwd, '.planning');
-        core.output(intel.intelSnapshot(planningDir), raw);
-      } else if (subcommand === 'patch-meta') {
-        const filePath = args[2];
-        if (!filePath) error('Usage: gsd-tools intel patch-meta <file-path>', ERROR_REASON.USAGE);
-        core.output(intel.intelPatchMeta(path.resolve(cwd, filePath)), raw);
-      } else if (subcommand === 'validate') {
-        const planningDir = path.join(cwd, '.planning');
-        core.output(intel.intelValidate(planningDir), raw);
-      } else if (subcommand === 'extract-exports') {
-        const filePath = args[2];
-        if (!filePath) error('Usage: gsd-tools intel extract-exports <file-path>', ERROR_REASON.USAGE);
-        core.output(intel.intelExtractExports(path.resolve(cwd, filePath)), raw);
-      } else if (subcommand === 'update') {
-        const planningDir = path.join(cwd, '.planning');
-        core.output(intel.intelUpdate(planningDir), raw);
-      } else if (subcommand === 'api-surface') {
-        const planningDir = path.join(cwd, '.planning');
-        core.output(intel.intelApiSurface(planningDir), raw);
-      } else {
-        error('Unknown intel subcommand. Available: query, status, update, diff, snapshot, patch-meta, validate, extract-exports, api-surface', ERROR_REASON.SDK_UNKNOWN_COMMAND);
-      }
-      break;
-    }
-
-    // ─── Graphify ──────────────────────────────────────────────────────────
-
-    case 'graphify': {
-      const graphify = require('./lib/graphify.cjs');
-      const subcommand = args[1];
-      if (subcommand === 'query') {
-        const term = args[2];
-        if (!term) error('Usage: gsd-tools graphify query <term>', ERROR_REASON.USAGE);
-        const budgetIdx = args.indexOf('--budget');
-        const budget = budgetIdx !== -1 ? parseInt(args[budgetIdx + 1], 10) : null;
-        core.output(graphify.graphifyQuery(cwd, term, { budget }), raw);
-      } else if (subcommand === 'status') {
-        core.output(graphify.graphifyStatus(cwd), raw);
-      } else if (subcommand === 'diff') {
-        core.output(graphify.graphifyDiff(cwd), raw);
-      } else if (subcommand === 'build') {
-        if (args[2] === 'snapshot') {
-          core.output(graphify.writeSnapshot(cwd), raw);
-        } else {
-          core.output(graphify.graphifyBuild(cwd), raw);
-        }
-      } else {
-        error('Unknown graphify subcommand. Available: build, query, status, diff', ERROR_REASON.SDK_UNKNOWN_COMMAND);
-      }
-      break;
-    }
-
     // ─── Documentation ────────────────────────────────────────────────────
 
     case 'docs-init': {
@@ -1369,7 +1485,7 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
         cwd,
         raw,
         error,
-        output: core.output,
+        output: output,
       });
       if (!handled) docs.cmdDocsInit(cwd, raw);
       break;
@@ -1400,6 +1516,17 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
       } else {
         error('Unknown learnings subcommand. Available: list, query, copy, prune, delete', ERROR_REASON.SDK_UNKNOWN_COMMAND);
       }
+      break;
+    }
+
+    // ─── teams-status ──────────────────────────────────────────────────────
+    // Read-only detector for claude-code's experimental agent-teams feature.
+    // issue #1355: stop gsd-core hanging silently under claude-code agent-teams.
+    // No capability registration needed — this is a diagnostic query command,
+    // not a feature capability.
+    case 'teams-status': {
+      const teamsStatus = require('./lib/teams-status.cjs');
+      teamsStatus.cmdTeamsStatus(cwd, { active: args.includes('--active') });
       break;
     }
 
@@ -1450,18 +1577,30 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
 
       const manifestKeys = new Set(Object.keys(manifest.files || {}));
 
-      // GSD-managed directories to scan for user-added files.
-      // These are the directories the installer wipes on update.
-      const GSD_MANAGED_DIRS = [
+      // GSD-managed directories to scan for user-added files. Whole-owned
+      // roots are wiped recursively; shared runtime roots are pruned by the
+      // same gsd-* top-level prefix used by install.js _removeGsdEntries.
+      const GSD_WHOLE_MANAGED_DIRS = [
         'gsd-core',
-        'agents',
         path.join('commands', 'gsd'),
+      ];
+      const GSD_PREFIX_MANAGED_DIRS = [
+        'agents',
         'hooks',
         'skills',
       ];
 
       function collectCustomFiles(dir, baseDir, manifestKeys, out) {
         if (!fs.existsSync(dir)) return;
+        const stat = fs.statSync(dir);
+        if (stat.isFile()) {
+          const relPath = path.relative(baseDir, dir).replace(/\\/g, '/');
+          if (!manifestKeys.has(relPath)) {
+            out.push(relPath);
+          }
+          return;
+        }
+        if (!stat.isDirectory()) return;
         for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
           const fullPath = path.join(dir, entry.name);
           if (entry.isDirectory()) {
@@ -1477,10 +1616,18 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
       }
 
       const customFiles = [];
-      for (const managedDir of GSD_MANAGED_DIRS) {
+      for (const managedDir of GSD_WHOLE_MANAGED_DIRS) {
         const absDir = path.join(resolvedConfigDir, managedDir);
         if (!fs.existsSync(absDir)) continue;
         collectCustomFiles(absDir, resolvedConfigDir, manifestKeys, customFiles);
+      }
+      for (const managedDir of GSD_PREFIX_MANAGED_DIRS) {
+        const absDir = path.join(resolvedConfigDir, managedDir);
+        if (!fs.existsSync(absDir)) continue;
+        for (const entry of fs.readdirSync(absDir, { withFileTypes: true })) {
+          if (!entry.name.startsWith('gsd-')) continue;
+          collectCustomFiles(path.join(absDir, entry.name), resolvedConfigDir, manifestKeys, customFiles);
+        }
       }
 
       const out = {
@@ -1695,7 +1842,7 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
     // ─── Research Store ────────────────────────────────────────────────────
     //
     // research-store get <key> [--kind <k>]
-    //   -> getResearch(cwd, key, { homeDir }); searches both tiers; core.output(result, raw)
+    //   -> getResearch(cwd, key, { homeDir }); searches both tiers; output(result, raw)
     //   (--kind is accepted for backward compatibility but no longer drives tier selection)
     // research-store put <key> --content <str> --source <s> --provider <p>
     //                           --confidence <c> --kind <k>
@@ -1719,7 +1866,7 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
         }
         // --kind is accepted but no longer drives tier selection; getResearch searches both tiers
         const result = researchStore.getResearch(cwd, key, { homeDir });
-        core.output(result, raw);
+        output(result, raw);
       } else if (subcommand === 'put') {
         const key = args[2];
         if (!key || key.startsWith('--')) {
@@ -1751,7 +1898,7 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
           error('Usage: gsd-tools research-store put <key> --content <str> --source <s> --provider <p> --confidence <c> --kind <k>', ERROR_REASON.USAGE);
         }
         const entry = researchStore.putResearch(cwd, key, { content, source, provider, confidence, kind }, { homeDir });
-        core.output(entry, raw);
+        output(entry, raw);
       } else {
         error('Unknown research-store subcommand. Available: get, put', ERROR_REASON.SDK_UNKNOWN_COMMAND);
       }
@@ -1787,14 +1934,14 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
       const { ecosystem = '', config: planConfig = {}, questions } = planInput;
       const homeDir = process.env.HOME || require('os').homedir();
       const plan = researchProvider.planResearch({ questions, ecosystem, config: planConfig, cwd, homeDir });
-      core.output(plan, raw);
+      output(plan, raw);
       break;
     }
 
     // ─── Classify Confidence ──────────────────────────────────────────────
     //
     // classify-confidence --provider <id> [--package <name> --ecosystem <npm|pypi|crates>] [--verified]
-    //   -> classifyConfidence({ provider, verifiedAgainstOfficial, legitimacyVerdict }); core.output(result, raw)
+    //   -> classifyConfidence({ provider, verifiedAgainstOfficial, legitimacyVerdict }); output(result, raw)
     //
     // legitimacyVerdict is CODE-COMPUTED via checkPackages — never caller-supplied — so an agent cannot self-assert OK→HIGH.
 
@@ -1821,7 +1968,7 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
         legitimacyVerdict = results[0] ? results[0].verdict : null;
       }
       const confidence = researchProvider.classifyConfidence({ provider, verifiedAgainstOfficial: verified, legitimacyVerdict });
-      core.output({ provider, package: pkg || null, ecosystem: ecosystem || null, legitimacyVerdict, verified, confidence }, raw);
+      output({ provider, package: pkg || null, ecosystem: ecosystem || null, legitimacyVerdict, verified, confidence }, raw);
       break;
     }
 
@@ -1865,7 +2012,7 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
       } catch (pkgErr) {
         error(`package-legitimacy: ${pkgErr && pkgErr.message ? pkgErr.message : String(pkgErr)}`, ERROR_REASON.UNKNOWN);
       }
-      core.output(pkgResults, raw);
+      output(pkgResults, raw);
       break;
     }
 
@@ -1903,7 +2050,163 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
       break;
     }
 
+    // ─── User Story Validation (bug #1145) ────────────────────────────────────
+    //
+    // Invocation shapes (from mvp-phase.md and verify-work.md):
+    //   gsd_run query user-story.validate --story "$USER_STORY"
+    //   gsd_run query user-story.validate --story "$PHASE_GOAL" --pick valid
+    //
+    // Returns JSON: { valid: boolean, errors: string[], slots: { role, capability, outcome } | null }
+    //   - valid: true only when the story fully matches the canonical format
+    //   - errors: per-slot diagnostic strings (empty on success)
+    //   - slots: extracted role/capability/outcome on success; null on failure
+    //
+    // Canonical format (user-story-template.md):
+    //   "As a [user role], I want to [capability], so that [outcome]."
+    //   Each slot must be non-empty and contain non-whitespace content.
+    //
+    // No .planning/ access needed — pure string validation.
+
+    // #1146: single base-branch resolver for all forking workflows.
+    // Workflows call `gsd_run query git.base-branch` (dotted form normalised to
+    // command='git', args=['git','base-branch']).
+    case 'git': {
+      const subcommand = args[1];
+      if (subcommand !== 'base-branch') {
+        error(
+          `Unknown git subcommand: ${subcommand || '(none)'}. Available: base-branch`,
+          ERROR_REASON.SDK_UNKNOWN_COMMAND,
+        );
+        break;
+      }
+      cmdGitBaseBranch(cwd, args.slice(2));
+      break;
+    }
+
+    case 'user-story': {
+      const subcommand = args[1];
+      if (subcommand !== 'validate') {
+        error(`Unknown user-story subcommand: ${subcommand || '(none)'}. Available: validate`, ERROR_REASON.SDK_UNKNOWN_COMMAND);
+        break;
+      }
+
+      const storyIdx = args.indexOf('--story');
+      const story = (storyIdx !== -1 && args[storyIdx + 1] && !args[storyIdx + 1].startsWith('--'))
+        ? args[storyIdx + 1]
+        : '';
+
+      // Canonical extraction regex — requires non-whitespace content in each slot
+      // (\S.*? ensures the slot isn't whitespace-only).
+      // Named groups: role / capability / outcome.
+      const USER_STORY_RE = /^As a (\S.*?), I want to (\S.*?), so that (\S.*?)\.$/;
+
+      const errors = [];
+      const trimmed = story.trim();
+      let slots = null;
+
+      if (!trimmed) {
+        errors.push('Story is empty. Required format: "As a [role], I want to [capability], so that [outcome]."');
+      } else {
+        // Per-clause guards produce targeted, actionable error messages before
+        // attempting the full regex. Guards are ordered: role → capability → outcome → period.
+        if (!/^As a \S/i.test(trimmed)) {
+          errors.push('Story must start with "As a [user role]," (role must be non-empty).');
+        }
+        if (!/, I want to \S/i.test(trimmed)) {
+          errors.push('Story must include ", I want to [capability]," (capability must be non-empty).');
+        }
+        if (!/, so that \S/i.test(trimmed)) {
+          errors.push('Story must include ", so that [outcome]." (outcome must be non-empty).');
+        }
+        if (!trimmed.endsWith('.')) {
+          errors.push('Story must end with a period (.).');
+        }
+        // Full-regex check only when per-clause guards all passed — avoids
+        // redundant "format mismatch" noise on top of specific error messages.
+        if (errors.length === 0) {
+          const m = USER_STORY_RE.exec(trimmed);
+          if (!m) {
+            errors.push('Story does not match the canonical format: "As a [role], I want to [capability], so that [outcome]."');
+          } else {
+            slots = { role: m[1], capability: m[2], outcome: m[3] };
+          }
+        }
+      }
+
+      output({ valid: errors.length === 0, errors, slots }, raw);
+      break;
+    }
+
+    case 'drift-guard': {
+      // ADR-22: deterministic authority resolution + severity classification.
+      // Subcommands:
+      //   drift-guard authority                          → effective authority string
+      //   drift-guard severity --status <S> [--authority <A>]  → {severity, hardBlock}
+      const subcommand = args[1];
+
+      // Read config.json directly for both plan_review.source_grounding_authority
+      // and intel.enabled. Neither key is in the config-loader.cjs whitelist that
+      // config-loader.cjs's loadConfig() whitelist does not return; plan_review is only in config.cjs's private
+      // buildConfig(), and intel is a federated capability config key.
+      let configuredAuthority = 'grep';
+      let intelEnabled = false;
+      try {
+        const { planningDir } = require('./lib/planning-workspace.cjs');
+        const cfgPath = require('path').join(planningDir(cwd), 'config.json');
+        if (require('fs').existsSync(cfgPath)) {
+          const rawCfg = JSON.parse(require('fs').readFileSync(cfgPath, 'utf-8'));
+          if (rawCfg && rawCfg.plan_review && rawCfg.plan_review.source_grounding_authority) {
+            configuredAuthority = String(rawCfg.plan_review.source_grounding_authority);
+          }
+          if (rawCfg && rawCfg.intel && rawCfg.intel.enabled === true) {
+            intelEnabled = true;
+          }
+        }
+      } catch {
+        // not fatal — defaults apply
+      }
+
+      const effectiveAuthority = getEffectiveAuthority(configuredAuthority, intelEnabled);
+
+      if (subcommand === 'authority') {
+        // Pass rawValue as 3rd arg so --raw returns unquoted string (not JSON)
+        output(effectiveAuthority, raw, effectiveAuthority);
+        break;
+      }
+
+      if (subcommand === 'severity') {
+        const statusIdx = args.indexOf('--status');
+        const statusVal = statusIdx !== -1 ? args[statusIdx + 1] : undefined;
+        if (!statusVal || statusVal.startsWith('--')) {
+          error('drift-guard severity requires --status <VERIFIED|MISSING|AMBIGUOUS|UNCHECKABLE>', ERROR_REASON.SDK_UNKNOWN_COMMAND);
+          break;
+        }
+        const authIdx = args.indexOf('--authority');
+        const authVal = authIdx !== -1 ? args[authIdx + 1] : undefined;
+        const authorityForClassify = (authVal && !authVal.startsWith('--'))
+          ? authVal
+          : effectiveAuthority;
+        const result = classifyDriftSeverity({ status: statusVal, authority: authorityForClassify });
+        output(result, raw);
+        break;
+      }
+
+      error(
+        `Unknown drift-guard subcommand: ${subcommand || '(none)'}. Available: authority, severity`,
+        ERROR_REASON.SDK_UNKNOWN_COMMAND,
+      );
+      break;
+    }
+
     default: {
+      // ADR-959: try capability-registry dispatch before emitting the unknown-command error.
+      // An unmigrated command still hits its hardcoded `case` above — untouched.
+      // A migrated command's `case` is removed at cutover, so it reaches here and
+      // dispatchCapabilityCommand routes it to the capability's registered router.
+      // commandFamilies now includes migrated capabilities (e.g. graphify → graphify-command-router.cjs);
+      // this returns true when a registered capability owns the command, false otherwise.
+      if (dispatchCapabilityCommand({ command, args, cwd, raw, error })) break;
+
       // #3243: if the caller passed a dotted form (e.g. "foo.bar"), the shim
       // above split it so `command` here is the head ("foo"). Use
       // originalCommand to reconstruct the original dotted form and suggest
@@ -1925,4 +2228,12 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
   }
 }
 
-runMain(main);
+// ─── CLI entry point ──────────────────────────────────────────────────────────
+if (require.main === module) {
+  runMain(main);
+}
+
+// ─── Exports (for tests) ──────────────────────────────────────────────────────
+// ADR-959: export dispatchCapabilityCommand so tests can exercise it with
+// synthetic registry + requireModule injections.
+module.exports = { dispatchCapabilityCommand };

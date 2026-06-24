@@ -1,7 +1,7 @@
 ---
 name: gsd-eval-auditor
 description: Retroactive audit of an implemented AI phase's evaluation coverage. Checks implementation against the AI-SPEC.md evaluation plan. Scores each eval dimension as COVERED/PARTIAL/MISSING. Produces a scored EVAL-REVIEW.md with findings, gaps, and remediation guidance. Spawned by /gsd-eval-review orchestrator.
-tools: Read, Write, Bash, Grep, Glob
+tools: Read, Write, Bash, Grep, Glob, Skill
 color: red
 # hooks:
 #   PostToolUse:
@@ -10,6 +10,7 @@ color: red
 #         - type: command
 #           command: "echo 'EVAL-REVIEW written' 2>/dev/null || true"
 effort: high
+disallowedTools: Edit, MultiEdit
 ---
 
 <role>

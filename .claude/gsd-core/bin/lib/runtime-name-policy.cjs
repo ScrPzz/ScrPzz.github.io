@@ -28,11 +28,12 @@ const FALLBACK_ALIASES = {
     copilot: ['copilot', 'copilot-cli', 'github-copilot'],
     antigravity: ['antigravity', 'antigravity-cli', 'antigravity-agent'],
     cursor: ['cursor', 'cursor-cli', 'cursor-nightly'],
-    windsurf: ['windsurf', 'windsurf-cli', 'windsurf-next'],
+    windsurf: ['windsurf', 'windsurf-cli', 'windsurf-next', 'devin-desktop'],
     augment: ['augment', 'augment-code', 'augment-cli'],
     trae: ['trae', 'trae-cli'],
     qwen: ['qwen', 'qwen-code', 'qwen-cli'],
     hermes: ['hermes', 'hermes-agent', 'hermes-cli'],
+    kimi: ['kimi'],
     codebuddy: ['codebuddy', 'codebuddy-cli'],
     cline: ['cline', 'cline-cli'],
 };
