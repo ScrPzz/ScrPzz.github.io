@@ -28,7 +28,7 @@ outputs:
 params:
   env: production
   title: "Alessandro Togni"
-  description: "Data Scientist — flood detection, edge AI, satellite imagery"
+  description: "Senior data scientist — aerospace, satellite data, edge AI"
   keywords:
     - Data Science
     - Knowledge Distillation
@@ -67,9 +67,8 @@ params:
   homeInfoParams:
     Title: "👋 Hi, I'm Alessandro"
     Content: >
-      Data scientist at the Italian Space Agency (ASI). I write about knowledge
-      distillation, neural architecture search, and edge AI for satellite
-      remote sensing.
+      Senior data scientist working in aerospace with satellite data. I write about
+      model compression, neural architecture search, and edge AI for remote sensing.
 
   socialIcons:
     - name: github
