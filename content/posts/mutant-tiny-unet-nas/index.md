@@ -1,7 +1,7 @@
 ---
 title: "MUTANT: searching for the smallest U-Net that still works"
 date: 2026-09-04
-draft: true
+draft: false
 tags: ["neural-architecture-search", "segmentation", "quantization", "edge-ai", "pytorch", "remote-sensing"]
 categories: ["research"]
 summary: "An evolutionary, multi-objective search for tiny U-Nets, a training-and-INT8 pipeline for the winners, and what happened on a public flood-mapping benchmark."
@@ -398,8 +398,9 @@ produced with an in-tree PyTorch 2.10 quantization flow and an XNNPACK quantizer
 versions no longer ship. MUTANT uses the successor of that flow in `torchao` with an x86 quantizer,
 so INT8 results from the released code are comparable in spirit, not in bits.
 
-<!-- TODO: a from-scratch reproduction of sweetspot_626k with `mutant train` (grid training pool
-without water-centred tiles, torchao INT8) is running; add its FP32 and INT8 test IoU here. -->
+*A from-scratch reproduction of `sweetspot_626k` with the released code (grid training pool without
+water-centred tiles, INT8 through `torchao`) is running while this post goes out; its FP32 and INT8
+test numbers will be added here as soon as it finishes.*
 
 ### 12. Limitations
 
