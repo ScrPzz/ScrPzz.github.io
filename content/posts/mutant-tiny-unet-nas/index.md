@@ -398,9 +398,47 @@ produced with an in-tree PyTorch 2.10 quantization flow and an XNNPACK quantizer
 versions no longer ship. MUTANT uses the successor of that flow in `torchao` with an x86 quantizer,
 so INT8 results from the released code are comparable in spirit, not in bits.
 
-*A from-scratch reproduction of `sweetspot_626k` with the released code (grid training pool without
-water-centred tiles, INT8 through `torchao`) is running while this post goes out; its FP32 and INT8
-test numbers will be added here as soon as it finishes.*
+**Reproduction from scratch.** After the post went out I trained `sweetspot_626k` again with the
+released code alone: the public GeoTIFF adapter with the training spec of the case-study document
+(grid tiles only, filtered with `min_target_frac` 0.05 and `max_ignore_frac` 0.5: 5,443 training
+tiles against the 12,838 of the original pool, which also contained water-centred tiles), the same
+protocol (Dice + weighted BCE, AdamW at 10⁻⁴, up to 60 FP32 epochs with patience 22, batch size 8, no
+augmentation, then calibration and up to 40 QAT epochs at 10⁻⁵), INT8 through `torchao`'s x86
+quantizer, and `mutant eval` on the same 911 validation and 1,226 test tiles with all-pixel
+calibration.
+
+| `sweetspot_626k` | Original run | Reproduction, released code |
+|---|---|---|
+| Training tiles per epoch | 12,838 (grid + water-centred) | 5,443 (grid) |
+| Epochs run, FP32 / QAT | 28 / 26 | 38 (best at 16) / 19 (best at 4) |
+| Test IoU FP32 | 0.8013 | 0.8017 |
+| Test mIoU / precision / recall, FP32 | 0.8568 / 0.932 / 0.851 | 0.8572 / 0.933 / 0.850 |
+| Test IoU INT8 | 0.8038 | 0.8117 |
+| Test mIoU / precision / recall, INT8 | 0.8587 / 0.934 / 0.852 | 0.8636 / 0.923 / 0.870 |
+| INT8 flow | torch 2.10 in-tree PT2E, XNNPACK quantizer | torchao 0.18 PT2E, x86 quantizer, 0.65 MB of weights |
+
+The FP32 result lands within 0.0004 of the original with fewer, and less water-rich, training tiles:
+the finalist's number is not an accident of the original tile pool. The INT8 model lands at 0.8117,
+0.010 above its own FP32 checkpoint and 0.008 above the original INT8 artifact, with the recall
+moving from 0.850 to 0.870 at a small cost in precision. The QAT phase is nineteen more epochs of
+fine-tuning at a low learning rate plus a fresh calibration, so I read the gain as training and
+operating point, not as a property of quantization. Both runs are single seeds, and the two INT8
+artifacts come from different quantizers, so by the standard of §12 differences of this size are not
+to be read as architecture, nor as quantization.
+
+
+**A bug worth telling.** The first attempt at this reproduction reported an "INT8" IoU of 0.8083,
+and it was wrong. On torch ≥ 2.11, `torch.export` no longer records the metadata that torchao's x86
+quantizer uses to find the convolutions; nothing was annotated, and `convert_pt2e` returned the FP32
+graph without a single error. The pipeline produced a 2.5 MB "INT8" artifact whose test metrics were
+those of the FP32 network after the QAT epochs. MUTANT 0.1.0 has this problem on that torch range.
+The fix is in the repository: the metadata is rebuilt, the conversion fails loudly when nothing is
+quantized, and the weight size counts only the tensors the graph reads (0.65 MB, not 2.5); release
+0.1.1 adds a refusal in `mutant eval` for any program that holds no quantize/dequantize operator.
+The historical INT8 numbers of §10 come from the earlier in-tree flow and were verified on their
+artifacts: they are unaffected. The lesson is the usual one: a quantization step that cannot fail is
+not checking that it quantized anything.
+
 
 ### 12. Limitations
 
@@ -414,8 +452,9 @@ test numbers will be added here as soon as it finishes.*
 - Validation and test scenes come from the same distribution of flood events; generalization to
   other regions, seasons or sensors was not evaluated.
 - The training tile pool of the original runs contained water-centred tiles that the public adapter
-  does not generate; a reproduction from scratch with the released code is expected to land close
-  to, not exactly on, the numbers above.
+  does not generate. The from-scratch reproduction of §11, on 5,443 grid tiles instead of 12,838,
+  landed on the FP32 number (0.8017 against 0.8013) and 0.008 above the original INT8 one;
+  one seed each, and two different quantizers.
 
 ### 13. Try it
 
