@@ -6,6 +6,9 @@
 # Hugo stats (used by some PostCSS/PurgeCSS setups)
 hugo_stats.json
 
+# Local source images (published copies live in the post's page bundle)
+/artistic_unet/
+
 # OS / editor cruft
 .DS_Store
 Thumbs.db
