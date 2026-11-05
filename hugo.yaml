@@ -64,10 +64,9 @@ params:
     disableHLJS: true # use Hugo's built-in Chroma highlighting, not highlight.js
 
   homeInfoParams:
-    Title: "👋 Hi, I'm Alessandro"
+    Title: "Skip connections"
     Content: >
-      Senior data scientist working in aerospace with satellite data. I write about
-      model compression, neural architecture search, and edge AI for remote sensing.
+      Senior data scientist working in aerospace with satellite data and neural networks.
 
   socialIcons:
     - name: github
